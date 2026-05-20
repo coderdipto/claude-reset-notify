@@ -1,0 +1,739 @@
+#!/usr/bin/env bash
+# claude-watch — monitor Claude Code limit status and notify via ntfy
+# Usage: claude-watch <install|start|stop|restart|status|config|logs|uninstall|run>
+
+set -uo pipefail
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Constants
+# ──────────────────────────────────────────────────────────────────────────────
+
+readonly VERSION="1.1.0"
+readonly APP_NAME="claude-watch"
+readonly LABEL="com.sudipto.claude-watch"
+
+readonly CONFIG_DIR="$HOME/.claude-watch"
+readonly CONFIG_FILE="$CONFIG_DIR/config.json"
+readonly STATE_FILE="$CONFIG_DIR/state.json"
+readonly LOG_FILE="$CONFIG_DIR/watch.log"
+readonly PID_FILE="$CONFIG_DIR/watch.pid"
+
+readonly PLIST_DIR="$HOME/Library/LaunchAgents"
+readonly PLIST_FILE="$PLIST_DIR/$LABEL.plist"
+
+readonly INSTALL_DIR="$HOME/bin"
+readonly INSTALL_PATH="$INSTALL_DIR/claude-watch"
+
+# Defaults
+readonly DEFAULT_NTFY_SERVER="https://ntfy.sh"
+readonly DEFAULT_INTERVAL_AVAILABLE=600   # 10 min
+readonly DEFAULT_INTERVAL_LIMITED=300     # 5 min
+readonly DEFAULT_TEST_PROMPT="ok"
+
+# Detect default device name (fallback chain: ComputerName → hostname → "Mac")
+default_device_name() {
+    local name
+    name=$(scutil --get ComputerName 2>/dev/null) || name=""
+    if [ -z "$name" ]; then
+        name=$(hostname -s 2>/dev/null) || name="Mac"
+    fi
+    echo "$name"
+}
+
+# Colors (TTY only)
+if [ -t 1 ]; then
+    readonly C_RESET=$'\033[0m'
+    readonly C_BOLD=$'\033[1m'
+    readonly C_RED=$'\033[31m'
+    readonly C_GREEN=$'\033[32m'
+    readonly C_YELLOW=$'\033[33m'
+    readonly C_BLUE=$'\033[34m'
+    readonly C_DIM=$'\033[2m'
+else
+    readonly C_RESET="" C_BOLD="" C_RED="" C_GREEN="" C_YELLOW="" C_BLUE="" C_DIM=""
+fi
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Utilities
+# ──────────────────────────────────────────────────────────────────────────────
+
+log() {
+    local msg="[$(date '+%Y-%m-%d %H:%M:%S')] $*"
+    echo "$msg" >> "$LOG_FILE"
+    # Also echo to stderr if running in foreground (run command), so launchd captures it
+    if [ "${FOREGROUND:-0}" = "1" ]; then
+        echo "$msg" >&2
+    fi
+}
+
+info()    { echo "${C_BLUE}ℹ${C_RESET}  $*"; }
+ok()      { echo "${C_GREEN}✓${C_RESET}  $*"; }
+warn()    { echo "${C_YELLOW}⚠${C_RESET}  $*"; }
+err()     { echo "${C_RED}✗${C_RESET}  $*" >&2; }
+header()  { echo ""; echo "${C_BOLD}$*${C_RESET}"; }
+
+die() {
+    err "$1"
+    exit "${2:-1}"
+}
+
+ensure_dirs() {
+    mkdir -p "$CONFIG_DIR" "$PLIST_DIR" "$INSTALL_DIR"
+}
+
+require_command() {
+    command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"
+}
+
+# Tiny JSON read/write without jq dependency
+# Reads a string field; falls back to default if missing
+json_get() {
+    local file="$1" key="$2" default="${3:-}"
+    if [ ! -f "$file" ]; then
+        echo "$default"
+        return
+    fi
+    local val
+    val=$(/usr/bin/python3 -c "
+import json, sys
+try:
+    with open('$file') as f:
+        d = json.load(f)
+    v = d.get('$key', '$default')
+    print(v if v is not None else '$default')
+except Exception:
+    print('$default')
+" 2>/dev/null)
+    echo "$val"
+}
+
+json_set() {
+    local file="$1" key="$2" value="$3"
+    /usr/bin/python3 -c "
+import json, os
+file = '$file'
+key = '$key'
+value = '''$value'''
+d = {}
+if os.path.exists(file):
+    try:
+        with open(file) as f:
+            d = json.load(f)
+    except Exception:
+        d = {}
+# Try to coerce numbers
+try:
+    if value.isdigit():
+        d[key] = int(value)
+    else:
+        d[key] = value
+except Exception:
+    d[key] = value
+with open(file, 'w') as f:
+    json.dump(d, f, indent=2)
+"
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Config
+# ──────────────────────────────────────────────────────────────────────────────
+
+write_default_config() {
+    local topic="$1"
+    local device="$2"
+    cat > "$CONFIG_FILE" <<EOF
+{
+  "ntfy_topic": "$topic",
+  "ntfy_server": "$DEFAULT_NTFY_SERVER",
+  "device_name": "$device",
+  "interval_available_seconds": $DEFAULT_INTERVAL_AVAILABLE,
+  "interval_limited_seconds": $DEFAULT_INTERVAL_LIMITED,
+  "test_prompt": "$DEFAULT_TEST_PROMPT"
+}
+EOF
+}
+
+write_default_state() {
+    cat > "$STATE_FILE" <<EOF
+{
+  "state": "unknown",
+  "last_check": "",
+  "last_notification": "",
+  "started_at": ""
+}
+EOF
+}
+
+load_config() {
+    NTFY_TOPIC=$(json_get "$CONFIG_FILE" "ntfy_topic")
+    NTFY_SERVER=$(json_get "$CONFIG_FILE" "ntfy_server" "$DEFAULT_NTFY_SERVER")
+    DEVICE_NAME=$(json_get "$CONFIG_FILE" "device_name" "$(default_device_name)")
+    INTERVAL_AVAILABLE=$(json_get "$CONFIG_FILE" "interval_available_seconds" "$DEFAULT_INTERVAL_AVAILABLE")
+    INTERVAL_LIMITED=$(json_get "$CONFIG_FILE" "interval_limited_seconds" "$DEFAULT_INTERVAL_LIMITED")
+    TEST_PROMPT=$(json_get "$CONFIG_FILE" "test_prompt" "$DEFAULT_TEST_PROMPT")
+
+    if [ -z "$NTFY_TOPIC" ]; then
+        die "ntfy_topic is not configured. Run: claude-watch install"
+    fi
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Notification
+# ──────────────────────────────────────────────────────────────────────────────
+
+send_notification() {
+    local title="$1"
+    local message="$2"
+    local priority="${3:-default}"  # default, high, urgent
+    local tags="${4:-bell}"
+
+    if [ -z "${NTFY_TOPIC:-}" ]; then
+        log "ERROR: cannot send notification, NTFY_TOPIC not set"
+        return 1
+    fi
+
+    # Prepend device name so multi-device users can tell which Mac alerted
+    local full_title="$title"
+    if [ -n "${DEVICE_NAME:-}" ]; then
+        full_title="[$DEVICE_NAME] $title"
+    fi
+
+    local url="$NTFY_SERVER/$NTFY_TOPIC"
+    local http_code
+    http_code=$(curl -s -o /dev/null -w "%{http_code}" \
+        -H "Title: $full_title" \
+        -H "Priority: $priority" \
+        -H "Tags: $tags" \
+        -d "$message" \
+        "$url" 2>&1) || true
+
+    if [ "$http_code" = "200" ]; then
+        log "Notification sent: $full_title"
+        json_set "$STATE_FILE" "last_notification" "$(date '+%Y-%m-%d %H:%M:%S') — $full_title"
+        return 0
+    else
+        log "Notification failed (HTTP $http_code): $full_title"
+        return 1
+    fi
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Claude limit detection
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Returns:
+#   0 = available
+#   1 = limited
+#   2 = unknown error (don't change state)
+check_claude_status() {
+    local output exit_code
+
+    if ! command -v claude >/dev/null 2>&1; then
+        log "ERROR: 'claude' command not found on PATH"
+        return 2
+    fi
+
+    output=$(claude --print "$TEST_PROMPT" 2>&1)
+    exit_code=$?
+
+    if [ $exit_code -eq 0 ]; then
+        return 0
+    fi
+
+    if echo "$output" | grep -qiE "limit reached|rate limit|usage limit|quota"; then
+        log "Limit detected: $(echo "$output" | head -1)"
+        return 1
+    fi
+
+    log "Unknown error from claude (exit $exit_code): $(echo "$output" | head -3 | tr '\n' ' ')"
+    return 2
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Main loop (the daemon body)
+# ──────────────────────────────────────────────────────────────────────────────
+
+run_loop() {
+    export FOREGROUND=1
+    load_config
+
+    # Record PID for status/stop
+    echo $$ > "$PID_FILE"
+
+    # Trap to clean up
+    trap 'log "Daemon stopping (signal received)"; rm -f "$PID_FILE"; exit 0' TERM INT
+
+    json_set "$STATE_FILE" "started_at" "$(date '+%Y-%m-%d %H:%M:%S')"
+    log "Daemon started (PID $$, version $VERSION)"
+    log "Config: device=$DEVICE_NAME, topic=$NTFY_TOPIC, available_interval=${INTERVAL_AVAILABLE}s, limited_interval=${INTERVAL_LIMITED}s"
+
+    local current_state
+    current_state=$(json_get "$STATE_FILE" "state" "unknown")
+
+    while true; do
+        check_claude_status
+        local result=$?
+
+        json_set "$STATE_FILE" "last_check" "$(date '+%Y-%m-%d %H:%M:%S')"
+
+        case "$result:$current_state" in
+            "0:limited")
+                # Limit just cleared
+                log "STATE TRANSITION: limited → available"
+                send_notification \
+                    "Claude Code limit cleared" \
+                    "Your Claude Code session is available again. Time to resume work." \
+                    "high" \
+                    "white_check_mark,sparkles"
+                current_state="available"
+                json_set "$STATE_FILE" "state" "available"
+                ;;
+            "0:unknown"|"0:")
+                # First successful check
+                log "Initial state: available"
+                current_state="available"
+                json_set "$STATE_FILE" "state" "available"
+                ;;
+            "0:available")
+                # Still available, no notification
+                ;;
+            "1:available"|"1:unknown"|"1:")
+                # Limit just hit (or first check found a limit)
+                log "STATE TRANSITION: → limited"
+                send_notification \
+                    "Claude Code limit reached" \
+                    "Your Claude Code limit is currently exhausted. I'll let you know when it resets." \
+                    "default" \
+                    "warning,hourglass"
+                current_state="limited"
+                json_set "$STATE_FILE" "state" "limited"
+                ;;
+            "1:limited")
+                # Still limited, no notification
+                ;;
+            "2:"*)
+                # Unknown error, hold state
+                log "Holding state '$current_state' due to unknown error"
+                ;;
+        esac
+
+        # Pick sleep interval based on current state
+        local sleep_sec
+        if [ "$current_state" = "limited" ]; then
+            sleep_sec=$INTERVAL_LIMITED
+        else
+            sleep_sec=$INTERVAL_AVAILABLE
+        fi
+
+        log "Sleeping ${sleep_sec}s (state=$current_state)"
+        sleep "$sleep_sec"
+    done
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# LaunchAgent management
+# ──────────────────────────────────────────────────────────────────────────────
+
+write_plist() {
+    cat > "$PLIST_FILE" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>$LABEL</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>$INSTALL_PATH</string>
+        <string>run</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>$LOG_FILE</string>
+
+    <key>StandardErrorPath</key>
+    <string>$LOG_FILE</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$HOME/.claude/local:$HOME/bin</string>
+    </dict>
+
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+</dict>
+</plist>
+EOF
+}
+
+is_loaded() {
+    launchctl list 2>/dev/null | grep -q "$LABEL"
+}
+
+load_agent() {
+    launchctl load "$PLIST_FILE" 2>/dev/null || launchctl bootstrap "gui/$(id -u)" "$PLIST_FILE" 2>/dev/null
+}
+
+unload_agent() {
+    launchctl unload "$PLIST_FILE" 2>/dev/null || launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Commands
+# ──────────────────────────────────────────────────────────────────────────────
+
+cmd_install() {
+    ensure_dirs
+
+    header "Installing $APP_NAME v$VERSION"
+
+    # Check claude is installed
+    if ! command -v claude >/dev/null 2>&1; then
+        warn "'claude' command not found on PATH"
+        warn "Make sure Claude Code is installed before starting the daemon"
+    else
+        ok "Found claude: $(command -v claude)"
+    fi
+
+    # Copy self to install path
+    local src
+    src=$(realpath "$0" 2>/dev/null || echo "$0")
+    if [ "$src" != "$INSTALL_PATH" ]; then
+        cp "$src" "$INSTALL_PATH"
+        chmod +x "$INSTALL_PATH"
+        ok "Installed to $INSTALL_PATH"
+    else
+        ok "Already at $INSTALL_PATH"
+    fi
+
+    # Check PATH
+    if ! echo ":$PATH:" | grep -q ":$INSTALL_DIR:"; then
+        warn "$INSTALL_DIR is not on your PATH"
+        info "Add this to ~/.zshrc:"
+        echo "    export PATH=\"\$HOME/bin:\$PATH\""
+    fi
+
+    # Get ntfy topic
+    local topic="${NTFY_TOPIC_FLAG:-}"
+    if [ -z "$topic" ] && [ -f "$CONFIG_FILE" ]; then
+        topic=$(json_get "$CONFIG_FILE" "ntfy_topic")
+    fi
+    if [ -z "$topic" ]; then
+        echo ""
+        info "Choose a unique, hard-to-guess ntfy topic name (this is your 'auth')."
+        info "Example: ${C_DIM}sudipto-claude-$(openssl rand -hex 4 2>/dev/null || echo 'a1b2c3d4')${C_RESET}"
+        read -r -p "ntfy topic: " topic
+        if [ -z "$topic" ]; then
+            die "Topic is required."
+        fi
+    fi
+
+    # Get device name (so multi-device users can tell which Mac alerted)
+    local device=""
+    if [ -f "$CONFIG_FILE" ]; then
+        device=$(json_get "$CONFIG_FILE" "device_name")
+    fi
+    if [ -z "$device" ]; then
+        local suggested
+        suggested=$(default_device_name)
+        echo ""
+        info "Pick a label for this device — it'll appear in every notification."
+        info "Useful when you share one ntfy topic across multiple Macs."
+        read -r -p "Device name [${suggested}]: " device
+        if [ -z "$device" ]; then
+            device="$suggested"
+        fi
+    fi
+
+    write_default_config "$topic" "$device"
+    ok "Config written to $CONFIG_FILE"
+    info "Device label: ${C_BOLD}$device${C_RESET}"
+
+    if [ ! -f "$STATE_FILE" ]; then
+        write_default_state
+    fi
+
+    # Write & load plist
+    write_plist
+    ok "LaunchAgent written to $PLIST_FILE"
+
+    if is_loaded; then
+        unload_agent
+    fi
+    load_agent
+
+    if is_loaded; then
+        ok "Daemon loaded with launchd"
+    else
+        warn "Daemon did not load cleanly. Try: claude-watch start"
+    fi
+
+    # Send a test notification
+    echo ""
+    info "Sending test notification to ntfy.sh/$topic ..."
+    load_config
+    if send_notification "claude-watch installed" "Subscribe to topic '$topic' on your phone to receive limit alerts." "default" "wave"; then
+        ok "Test notification sent"
+    else
+        warn "Test notification failed (check network or topic name)"
+    fi
+
+    echo ""
+    header "Next steps"
+    echo "  1. Install the ${C_BOLD}ntfy${C_RESET} app on your phone (App Store / Play Store)"
+    echo "  2. Subscribe to topic: ${C_BOLD}$topic${C_RESET}"
+    echo "  3. Server: ${C_BOLD}$DEFAULT_NTFY_SERVER${C_RESET}"
+    echo ""
+    echo "  Useful commands:"
+    echo "    claude-watch status      # check daemon state"
+    echo "    claude-watch logs        # tail logs"
+    echo "    claude-watch config      # view/edit settings"
+    echo "    claude-watch stop        # stop the daemon"
+    echo "    claude-watch uninstall   # remove everything"
+    echo ""
+}
+
+cmd_start() {
+    if [ ! -f "$PLIST_FILE" ]; then
+        die "Not installed. Run: claude-watch install"
+    fi
+    if is_loaded; then
+        info "Daemon is already running."
+        return 0
+    fi
+    load_agent
+    sleep 1
+    if is_loaded; then
+        ok "Daemon started"
+    else
+        die "Failed to start daemon. Check logs: claude-watch logs"
+    fi
+}
+
+cmd_stop() {
+    if ! is_loaded; then
+        info "Daemon is not running."
+        return 0
+    fi
+    unload_agent
+    sleep 1
+    if is_loaded; then
+        warn "Daemon did not stop cleanly"
+    else
+        ok "Daemon stopped"
+    fi
+    rm -f "$PID_FILE"
+}
+
+cmd_restart() {
+    cmd_stop
+    sleep 1
+    cmd_start
+}
+
+cmd_status() {
+    header "$APP_NAME status"
+
+    if [ ! -f "$CONFIG_FILE" ]; then
+        warn "Not installed."
+        echo "  Run: claude-watch install"
+        return 1
+    fi
+
+    local running="no"
+    if is_loaded; then
+        running="yes"
+    fi
+
+    local state last_check last_notification started_at
+    state=$(json_get "$STATE_FILE" "state" "unknown")
+    last_check=$(json_get "$STATE_FILE" "last_check" "never")
+    last_notification=$(json_get "$STATE_FILE" "last_notification" "none")
+    started_at=$(json_get "$STATE_FILE" "started_at" "unknown")
+
+    local topic interval_a interval_l device
+    topic=$(json_get "$CONFIG_FILE" "ntfy_topic")
+    device=$(json_get "$CONFIG_FILE" "device_name" "$(default_device_name)")
+    interval_a=$(json_get "$CONFIG_FILE" "interval_available_seconds" "$DEFAULT_INTERVAL_AVAILABLE")
+    interval_l=$(json_get "$CONFIG_FILE" "interval_limited_seconds" "$DEFAULT_INTERVAL_LIMITED")
+
+    local running_disp
+    if [ "$running" = "yes" ]; then
+        running_disp="${C_GREEN}running${C_RESET}"
+    else
+        running_disp="${C_RED}stopped${C_RESET}"
+    fi
+
+    local state_disp
+    case "$state" in
+        available) state_disp="${C_GREEN}available${C_RESET}" ;;
+        limited)   state_disp="${C_YELLOW}limited${C_RESET}"  ;;
+        *)         state_disp="${C_DIM}$state${C_RESET}"      ;;
+    esac
+
+    echo "  Daemon:            $running_disp"
+    echo "  Claude state:      $state_disp"
+    echo "  Device label:      $device"
+    echo "  Last check:        $last_check"
+    echo "  Last notification: $last_notification"
+    echo "  Started at:        $started_at"
+    echo ""
+    echo "  ntfy topic:        $topic"
+    echo "  Poll (available):  ${interval_a}s"
+    echo "  Poll (limited):    ${interval_l}s"
+    echo "  Log file:          $LOG_FILE"
+    echo ""
+}
+
+cmd_config() {
+    if [ ! -f "$CONFIG_FILE" ]; then
+        die "Not installed. Run: claude-watch install"
+    fi
+
+    if [ $# -eq 0 ]; then
+        header "Current config"
+        cat "$CONFIG_FILE"
+        echo ""
+        info "To edit: claude-watch config <key> <value>"
+        info "Keys: ntfy_topic, ntfy_server, device_name, interval_available_seconds, interval_limited_seconds, test_prompt"
+        return 0
+    fi
+
+    if [ $# -ne 2 ]; then
+        die "Usage: claude-watch config <key> <value>"
+    fi
+
+    local key="$1" value="$2"
+    json_set "$CONFIG_FILE" "$key" "$value"
+    ok "Set $key = $value"
+    info "Restart the daemon for changes to take effect: claude-watch restart"
+}
+
+cmd_logs() {
+    if [ ! -f "$LOG_FILE" ]; then
+        die "No log file yet at $LOG_FILE"
+    fi
+    if [ "${1:-}" = "-f" ] || [ "${1:-}" = "--follow" ]; then
+        tail -f "$LOG_FILE"
+    else
+        tail -n 50 "$LOG_FILE"
+    fi
+}
+
+cmd_uninstall() {
+    header "Uninstalling $APP_NAME"
+
+    if is_loaded; then
+        unload_agent
+        ok "Daemon stopped"
+    fi
+
+    if [ -f "$PLIST_FILE" ]; then
+        rm -f "$PLIST_FILE"
+        ok "Removed $PLIST_FILE"
+    fi
+
+    if [ -f "$INSTALL_PATH" ]; then
+        rm -f "$INSTALL_PATH"
+        ok "Removed $INSTALL_PATH"
+    fi
+
+    echo ""
+    read -r -p "Also delete config and logs at $CONFIG_DIR? [y/N] " ans
+    if [ "$ans" = "y" ] || [ "$ans" = "Y" ]; then
+        rm -rf "$CONFIG_DIR"
+        ok "Removed $CONFIG_DIR"
+    else
+        info "Kept $CONFIG_DIR"
+    fi
+
+    echo ""
+    ok "Uninstalled."
+}
+
+cmd_test_notify() {
+    load_config
+    info "Sending test notification..."
+    if send_notification "claude-watch test" "If you see this, ntfy is working correctly." "default" "test_tube"; then
+        ok "Sent"
+    else
+        die "Failed to send notification"
+    fi
+}
+
+cmd_help() {
+    cat <<EOF
+${C_BOLD}claude-watch${C_RESET} v$VERSION — monitor Claude Code limit status and notify via ntfy
+
+${C_BOLD}USAGE${C_RESET}
+    claude-watch <command> [args]
+
+${C_BOLD}COMMANDS${C_RESET}
+    install              Install the daemon (prompts for ntfy topic)
+    start                Start the background daemon
+    stop                 Stop the background daemon
+    restart              Restart the daemon
+    status               Show daemon and Claude state
+    config [k] [v]       Show or update config
+    logs [-f]            Show recent logs (-f to follow)
+    test-notify          Send a test notification
+    uninstall            Remove the daemon and config
+    run                  Run the loop in foreground (used by launchd)
+    help                 Show this message
+
+${C_BOLD}EXAMPLES${C_RESET}
+    claude-watch install
+    claude-watch status
+    claude-watch config interval_available_seconds 900
+    claude-watch logs -f
+    claude-watch stop
+
+${C_BOLD}FILES${C_RESET}
+    Config:   $CONFIG_FILE
+    State:    $STATE_FILE
+    Logs:     $LOG_FILE
+    Agent:    $PLIST_FILE
+EOF
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Entry point
+# ──────────────────────────────────────────────────────────────────────────────
+
+main() {
+    ensure_dirs
+
+    local cmd="${1:-help}"
+    shift || true
+
+    case "$cmd" in
+        install)      cmd_install "$@" ;;
+        start)        cmd_start "$@" ;;
+        stop)         cmd_stop "$@" ;;
+        restart)      cmd_restart "$@" ;;
+        status)       cmd_status "$@" ;;
+        config)       cmd_config "$@" ;;
+        logs)         cmd_logs "$@" ;;
+        test-notify|test) cmd_test_notify "$@" ;;
+        uninstall)    cmd_uninstall "$@" ;;
+        run)          run_loop "$@" ;;
+        help|--help|-h) cmd_help ;;
+        version|--version|-v) echo "$APP_NAME v$VERSION" ;;
+        *)
+            err "Unknown command: $cmd"
+            echo ""
+            cmd_help
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
