@@ -8,7 +8,7 @@ set -uo pipefail
 # Constants
 # ──────────────────────────────────────────────────────────────────────────────
 
-readonly VERSION="1.3.0"
+readonly VERSION="1.3.1"
 readonly APP_NAME="claude-watch"
 readonly LABEL="com.sudipto.claude-watch"
 
@@ -59,11 +59,9 @@ fi
 
 log() {
     local msg="[$(date '+%Y-%m-%d %H:%M:%S')] $*"
+    # Write directly to the log file. Under launchd, stdout/stderr are already
+    # redirected to this same file, so echoing as well would produce duplicates.
     echo "$msg" >> "$LOG_FILE"
-    # Also echo to stderr if running in foreground (run command), so launchd captures it
-    if [ "${FOREGROUND:-0}" = "1" ]; then
-        echo "$msg" >&2
-    fi
 }
 
 info()    { echo "${C_BLUE}ℹ${C_RESET}  $*"; }
@@ -229,7 +227,9 @@ check_claude_status() {
     local output exit_code
 
     if ! command -v claude >/dev/null 2>&1; then
-        log "ERROR: 'claude' command not found on PATH"
+        log "ERROR: 'claude' command not found on PATH (PATH=$PATH)"
+        log "HINT: rerun 'claude-watch install' from a shell where 'which claude' works,"
+        log "      or manually add claude's directory to ~/Library/LaunchAgents/$LABEL.plist"
         return 2
     fi
 
@@ -335,6 +335,20 @@ run_loop() {
 # ──────────────────────────────────────────────────────────────────────────────
 
 write_plist() {
+    # Discover where 'claude' lives so launchd's PATH actually finds it.
+    # Falls back to a sensible default list if 'claude' isn't on PATH yet.
+    local claude_dir=""
+    if command -v claude >/dev/null 2>&1; then
+        claude_dir=$(dirname "$(command -v claude)")
+    fi
+
+    # Build absolute PATH for launchd. $HOME is NOT expanded inside plists,
+    # so we use the real expanded value here.
+    local agent_path="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$HOME/.claude/local:$HOME/.local/bin:$HOME/bin"
+    if [ -n "$claude_dir" ] && ! echo ":$agent_path:" | grep -q ":$claude_dir:"; then
+        agent_path="$claude_dir:$agent_path"
+    fi
+
     cat > "$PLIST_FILE" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -364,7 +378,9 @@ write_plist() {
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$HOME/.claude/local:$HOME/bin</string>
+        <string>$agent_path</string>
+        <key>HOME</key>
+        <string>$HOME</string>
     </dict>
 
     <key>ThrottleInterval</key>
@@ -375,7 +391,15 @@ EOF
 }
 
 is_loaded() {
-    launchctl list 2>/dev/null | grep -q "$LABEL"
+    # Try both the old-style (list) and new-style (print) launchctl checks,
+    # since results from `list` alone aren't always reliable across macOS versions.
+    if launchctl list 2>/dev/null | grep -q "$LABEL"; then
+        return 0
+    fi
+    if launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then
+        return 0
+    fi
+    return 1
 }
 
 load_agent() {
