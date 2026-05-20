@@ -8,7 +8,7 @@ set -uo pipefail
 # Constants
 # ──────────────────────────────────────────────────────────────────────────────
 
-readonly VERSION="1.5.0"
+readonly VERSION="1.6.0"
 readonly APP_NAME="claude-watch"
 readonly LABEL="com.sudipto.claude-watch"
 
@@ -83,35 +83,38 @@ require_command() {
     command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"
 }
 
-# Tiny JSON read/write without jq dependency
-# Reads a string field; falls back to default if missing
+# Tiny JSON read/write without jq dependency.
+# Values are passed via environment variables so single-quotes, backslashes,
+# and other special characters in keys/values can't break the Python parser.
+
 json_get() {
     local file="$1" key="$2" default="${3:-}"
     if [ ! -f "$file" ]; then
         echo "$default"
         return
     fi
-    local val
-    val=$(/usr/bin/python3 -c "
-import json, sys
+    JG_FILE="$file" JG_KEY="$key" JG_DEFAULT="$default" /usr/bin/python3 - <<'PYEOF' 2>/dev/null
+import json, os, sys
+file    = os.environ.get("JG_FILE", "")
+key     = os.environ.get("JG_KEY", "")
+default = os.environ.get("JG_DEFAULT", "")
 try:
-    with open('$file') as f:
+    with open(file) as f:
         d = json.load(f)
-    v = d.get('$key', '$default')
-    print(v if v is not None else '$default')
+    v = d.get(key, default)
+    print(v if v is not None else default)
 except Exception:
-    print('$default')
-" 2>/dev/null)
-    echo "$val"
+    print(default)
+PYEOF
 }
 
 json_set() {
     local file="$1" key="$2" value="$3"
-    /usr/bin/python3 -c "
+    JS_FILE="$file" JS_KEY="$key" JS_VALUE="$value" /usr/bin/python3 - <<'PYEOF'
 import json, os
-file = '$file'
-key = '$key'
-value = '''$value'''
+file  = os.environ.get("JS_FILE", "")
+key   = os.environ.get("JS_KEY", "")
+value = os.environ.get("JS_VALUE", "")
 d = {}
 if os.path.exists(file):
     try:
@@ -119,17 +122,14 @@ if os.path.exists(file):
             d = json.load(f)
     except Exception:
         d = {}
-# Try to coerce numbers
-try:
-    if value.isdigit():
-        d[key] = int(value)
-    else:
-        d[key] = value
-except Exception:
+# Coerce digit-only strings to int for clean integer storage
+if value.isdigit():
+    d[key] = int(value)
+else:
     d[key] = value
-with open(file, 'w') as f:
+with open(file, "w") as f:
     json.dump(d, f, indent=2)
-"
+PYEOF
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -200,6 +200,8 @@ send_notification() {
     local url="$NTFY_SERVER/$NTFY_TOPIC"
     local http_code
     http_code=$(curl -s -o /dev/null -w "%{http_code}" \
+        --connect-timeout 5 \
+        --max-time 15 \
         -H "Title: $full_title" \
         -H "Priority: $priority" \
         -H "Tags: $tags" \
@@ -226,11 +228,11 @@ send_notification() {
 # Echoes the epoch on success, nothing on failure.
 parse_reset_epoch() {
     local message="$1"
-    /usr/bin/python3 - <<PYEOF 2>/dev/null
-import re, sys
-from datetime import datetime, timedelta, time as dtime
+    PR_MSG="$message" /usr/bin/python3 - <<'PYEOF' 2>/dev/null
+import re, os, sys
+from datetime import datetime, timedelta
 
-msg = """$message"""
+msg = os.environ.get("PR_MSG", "")
 # Match: "resets 2:10am", "resets at 14:30", "reset 2am"
 m = re.search(r'reset[s]?\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?', msg, re.IGNORECASE)
 if not m:
@@ -305,14 +307,30 @@ check_claude_status() {
 # ──────────────────────────────────────────────────────────────────────────────
 
 run_loop() {
-    export FOREGROUND=1
     load_config
+
+    # Rotate log if it's grown beyond 1 MB. Keep the most recent ~500KB worth
+    # of lines so history is preserved but the file doesn't grow forever.
+    if [ -f "$LOG_FILE" ]; then
+        local log_size
+        log_size=$(stat -f%z "$LOG_FILE" 2>/dev/null || stat -c%s "$LOG_FILE" 2>/dev/null || echo 0)
+        if [ "$log_size" -gt 1048576 ]; then
+            tail -c 524288 "$LOG_FILE" > "$LOG_FILE.tmp" && mv "$LOG_FILE.tmp" "$LOG_FILE"
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] Log rotated (was ${log_size} bytes)" >> "$LOG_FILE"
+        fi
+    fi
 
     # Record PID for status/stop
     echo $$ > "$PID_FILE"
 
-    # Trap to clean up
-    trap 'log "Daemon stopping (signal received)"; rm -f "$PID_FILE"; exit 0' TERM INT
+    # Trap to clean up. Kill the background sleep (if any) so we exit promptly.
+    SLEEP_PID=""
+    trap '
+        log "Daemon stopping (signal received)"
+        if [ -n "${SLEEP_PID:-}" ]; then kill "$SLEEP_PID" 2>/dev/null; fi
+        rm -f "$PID_FILE"
+        exit 0
+    ' TERM INT
 
     json_set "$STATE_FILE" "started_at" "$(date '+%Y-%m-%d %H:%M:%S')"
     log "Daemon started (PID $$, version $VERSION)"
@@ -331,14 +349,21 @@ run_loop() {
             "0:limited")
                 # Limit just cleared
                 log "STATE TRANSITION: limited → available"
-                send_notification \
+                if send_notification \
                     "Claude Code limit cleared" \
                     "Your Claude Code session is available again. Time to resume work." \
                     "high" \
                     "white_check_mark,sparkles"
-                current_state="available"
-                json_set "$STATE_FILE" "state" "available"
-                json_set "$STATE_FILE" "reset_epoch" ""
+                then
+                    current_state="available"
+                    json_set "$STATE_FILE" "state" "available"
+                    json_set "$STATE_FILE" "reset_epoch" ""
+                    json_set "$STATE_FILE" "pending_notification" ""
+                else
+                    # Hold the transition; retry on the next loop tick
+                    log "Will retry 'limit cleared' notification on next poll"
+                    json_set "$STATE_FILE" "pending_notification" "cleared"
+                fi
                 ;;
             "0:unknown"|"0:")
                 # First successful check
@@ -347,7 +372,21 @@ run_loop() {
                 json_set "$STATE_FILE" "state" "available"
                 ;;
             "0:available")
-                # Still available, no notification
+                # Still available, no notification.
+                # But if a previous "cleared" notification failed, try again now.
+                local pending
+                pending=$(json_get "$STATE_FILE" "pending_notification" "")
+                if [ "$pending" = "cleared" ]; then
+                    log "Retrying pending 'limit cleared' notification"
+                    if send_notification \
+                        "Claude Code limit cleared" \
+                        "Your Claude Code session is available again. Time to resume work." \
+                        "high" \
+                        "white_check_mark,sparkles"
+                    then
+                        json_set "$STATE_FILE" "pending_notification" ""
+                    fi
+                fi
                 ;;
             "1:available"|"1:unknown"|"1:")
                 # Limit just hit (or first check found a limit)
@@ -355,20 +394,53 @@ run_loop() {
                 local body="Your Claude Code limit is currently exhausted. I'll let you know when it resets."
                 if [ -n "${RESET_EPOCH:-}" ]; then
                     body="$body Expected reset: $(date -r "$RESET_EPOCH" '+%-I:%M %p')."
+                fi
+                # Persist reset_epoch first so a notification failure doesn't lose the parsed time
+                if [ -n "${RESET_EPOCH:-}" ]; then
                     json_set "$STATE_FILE" "reset_epoch" "$RESET_EPOCH"
                 fi
-                send_notification \
+                if send_notification \
                     "Claude Code limit reached" \
                     "$body" \
                     "default" \
                     "warning,hourglass"
-                current_state="limited"
-                json_set "$STATE_FILE" "state" "limited"
+                then
+                    current_state="limited"
+                    json_set "$STATE_FILE" "state" "limited"
+                    json_set "$STATE_FILE" "pending_notification" ""
+                else
+                    # Flip state anyway so we don't keep hammering claude every cycle —
+                    # but record that the "hit" notification still needs delivering.
+                    log "Will retry 'limit reached' notification on next poll"
+                    current_state="limited"
+                    json_set "$STATE_FILE" "state" "limited"
+                    json_set "$STATE_FILE" "pending_notification" "reached"
+                fi
                 ;;
             "1:limited")
                 # Still limited; refresh reset_epoch if we just parsed a new one
                 if [ -n "${RESET_EPOCH:-}" ]; then
                     json_set "$STATE_FILE" "reset_epoch" "$RESET_EPOCH"
+                fi
+                # Retry pending "reached" notification if we owe one
+                local pending
+                pending=$(json_get "$STATE_FILE" "pending_notification" "")
+                if [ "$pending" = "reached" ]; then
+                    log "Retrying pending 'limit reached' notification"
+                    local body="Your Claude Code limit is currently exhausted. I'll let you know when it resets."
+                    local stored_reset
+                    stored_reset=$(json_get "$STATE_FILE" "reset_epoch" "")
+                    if [ -n "$stored_reset" ]; then
+                        body="$body Expected reset: $(date -r "$stored_reset" '+%-I:%M %p')."
+                    fi
+                    if send_notification \
+                        "Claude Code limit reached" \
+                        "$body" \
+                        "default" \
+                        "warning,hourglass"
+                    then
+                        json_set "$STATE_FILE" "pending_notification" ""
+                    fi
                 fi
                 ;;
             "2:"*)
@@ -419,7 +491,13 @@ run_loop() {
         fi
 
         log "Sleeping ${sleep_sec}s (state=$current_state)"
-        sleep "$sleep_sec"
+        # Background the sleep and wait on it so SIGTERM/SIGINT interrupts immediately.
+        # Without this, a long sleep (potentially up to an hour during a limit cycle)
+        # would delay 'claude-watch stop' until the sleep returns on its own.
+        sleep "$sleep_sec" &
+        SLEEP_PID=$!
+        wait "$SLEEP_PID"
+        SLEEP_PID=""
     done
 }
 
@@ -484,11 +562,28 @@ EOF
 }
 
 is_loaded() {
-    # Try both the old-style (list) and new-style (print) launchctl checks,
-    # since results from `list` alone aren't always reliable across macOS versions.
-    if launchctl list 2>/dev/null | grep -q "$LABEL"; then
-        return 0
+    # The agent is "loaded" if launchctl knows about it. We further verify it's
+    # actually running (has a PID) — if it's in the list but has no PID and a
+    # non-zero exit code, launchd has thrown its hands up and we shouldn't
+    # report it as running.
+    local line
+    line=$(launchctl list 2>/dev/null | awk -v label="$LABEL" '$3 == label {print; exit}')
+    if [ -n "$line" ]; then
+        # Columns: PID  Status  Label
+        local pid status
+        pid=$(echo "$line" | awk '{print $1}')
+        status=$(echo "$line" | awk '{print $2}')
+        if [ "$pid" != "-" ]; then
+            return 0  # has a PID, is running
+        fi
+        # No PID. If status is 0, it just hasn't been spawned yet (rare).
+        # If non-zero, launchd has given up — treat as not loaded.
+        if [ "$status" = "0" ]; then
+            return 0
+        fi
+        return 1
     fi
+    # Fall back to the modern launchctl interface
     if launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then
         return 0
     fi
