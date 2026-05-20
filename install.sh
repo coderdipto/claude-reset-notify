@@ -73,13 +73,47 @@ mv "$INSTALL_PATH.tmp" "$INSTALL_PATH"
 chmod +x "$INSTALL_PATH"
 ok "Installed to $INSTALL_PATH"
 
-# Warn about PATH
-if ! echo ":$PATH:" | grep -q ":$INSTALL_DIR:"; then
-    warn "$INSTALL_DIR is not on your PATH."
-    info "Add this line to ~/.zshrc:"
-    echo "    export PATH=\"\$HOME/bin:\$PATH\""
-    echo ""
-fi
+# Auto-add ~/bin to PATH if missing
+ensure_path() {
+    if echo ":$PATH:" | grep -q ":$INSTALL_DIR:"; then
+        return 0
+    fi
+
+    # Pick the right rc file for the user's shell
+    local shell_name rc_file
+    shell_name=$(basename "${SHELL:-/bin/zsh}")
+    case "$shell_name" in
+        zsh)  rc_file="$HOME/.zshrc" ;;
+        bash) rc_file="$HOME/.bash_profile" ;;
+        *)    rc_file="$HOME/.profile" ;;
+    esac
+
+    local export_line='export PATH="$HOME/bin:$PATH"'
+    local marker='# Added by claude-watch installer'
+
+    # Skip if it's already there (e.g. from a previous install)
+    if [ -f "$rc_file" ] && grep -Fq "$export_line" "$rc_file"; then
+        ok "$INSTALL_DIR already in PATH (via $rc_file)"
+        return 0
+    fi
+
+    # Append, creating the file if needed
+    {
+        echo ""
+        echo "$marker"
+        echo "$export_line"
+    } >> "$rc_file"
+
+    ok "Added $INSTALL_DIR to PATH in $rc_file"
+    info "New terminals will pick this up automatically."
+    info "For this terminal, run: ${C_BOLD}source $rc_file${C_RESET}"
+    # Export for the rest of this installer run, so the test notification
+    # call and any follow-up commands work without restarting the shell.
+    export PATH="$INSTALL_DIR:$PATH"
+}
+
+ensure_path
+
 
 # Hand off to the script's own install command.
 # Stdin is the pipe from curl when curl|bash, so reopen /dev/tty for interactive prompts.
