@@ -8,7 +8,7 @@ set -uo pipefail
 # Constants
 # ──────────────────────────────────────────────────────────────────────────────
 
-readonly VERSION="1.1.0"
+readonly VERSION="1.2.0"
 readonly APP_NAME="claude-watch"
 readonly LABEL="com.sudipto.claude-watch"
 
@@ -437,8 +437,8 @@ cmd_install() {
     fi
 
     # Get device name (so multi-device users can tell which Mac alerted)
-    local device=""
-    if [ -f "$CONFIG_FILE" ]; then
+    local device="${DEVICE_NAME_FLAG:-}"
+    if [ -z "$device" ] && [ -f "$CONFIG_FILE" ]; then
         device=$(json_get "$CONFIG_FILE" "device_name")
     fi
     if [ -z "$device" ]; then
