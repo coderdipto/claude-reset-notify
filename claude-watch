@@ -8,7 +8,7 @@ set -uo pipefail
 # Constants
 # ──────────────────────────────────────────────────────────────────────────────
 
-readonly VERSION="1.6.0"
+readonly VERSION="1.7.0"
 readonly APP_NAME="claude-watch"
 readonly LABEL="com.sudipto.claude-watch"
 
@@ -339,99 +339,101 @@ run_loop() {
     local current_state
     current_state=$(json_get "$STATE_FILE" "state" "unknown")
 
-    while true; do
-        check_claude_status
-        local result=$?
+    # When we wake from a reset-timer sleep, skip calling Claude entirely and
+    # fire the "available" notification based on the elapsed time alone.
+    # Sending any message to Claude starts a new session, which we want to avoid.
+    local woke_from_reset=0
+    # On daemon restart: if the stored reset epoch is already in the past, treat
+    # this the same way — notify without polling Claude.
+    if [ "$current_state" = "limited" ]; then
+        local init_reset
+        init_reset=$(json_get "$STATE_FILE" "reset_epoch" "")
+        if [ -n "$init_reset" ] && [ "$(date +%s)" -ge "$init_reset" ]; then
+            log "Resuming after past-due reset (predicted $(date -r "$init_reset" '+%H:%M:%S')). Will notify without polling Claude."
+            woke_from_reset=1
+        fi
+    fi
 
+    while true; do
         json_set "$STATE_FILE" "last_check" "$(date '+%Y-%m-%d %H:%M:%S')"
 
-        case "$result:$current_state" in
-            "0:limited")
-                # Limit just cleared
-                log "STATE TRANSITION: limited → available"
-                if send_notification \
-                    "Claude Code limit cleared" \
-                    "Your Claude Code session is available again. Time to resume work." \
-                    "high" \
-                    "white_check_mark,sparkles"
-                then
-                    current_state="available"
-                    json_set "$STATE_FILE" "state" "available"
-                    json_set "$STATE_FILE" "reset_epoch" ""
-                    json_set "$STATE_FILE" "pending_notification" ""
-                else
-                    # Hold the transition; retry on the next loop tick
-                    log "Will retry 'limit cleared' notification on next poll"
-                    json_set "$STATE_FILE" "pending_notification" "cleared"
-                fi
-                ;;
-            "0:unknown"|"0:")
-                # First successful check
-                log "Initial state: available"
+        if [ "$woke_from_reset" -eq 1 ]; then
+            woke_from_reset=0
+            log "STATE TRANSITION: limited → available (reset timer expired)"
+            if send_notification \
+                "Claude Code limit cleared" \
+                "Your Claude Code session is available again. Time to resume work." \
+                "high" \
+                "white_check_mark,sparkles"
+            then
                 current_state="available"
                 json_set "$STATE_FILE" "state" "available"
-                ;;
-            "0:available")
-                # Still available, no notification.
-                # But if a previous "cleared" notification failed, try again now.
-                local pending
-                pending=$(json_get "$STATE_FILE" "pending_notification" "")
-                if [ "$pending" = "cleared" ]; then
-                    log "Retrying pending 'limit cleared' notification"
+                json_set "$STATE_FILE" "reset_epoch" ""
+                json_set "$STATE_FILE" "pending_notification" ""
+            else
+                log "Will retry 'limit cleared' notification on next poll"
+                current_state="available"
+                json_set "$STATE_FILE" "state" "available"
+                json_set "$STATE_FILE" "reset_epoch" ""
+                json_set "$STATE_FILE" "pending_notification" "cleared"
+            fi
+        else
+            check_claude_status
+            local result=$?
+
+            case "$result:$current_state" in
+                "0:limited")
+                    # Limit cleared — only reached via fallback polling (past-predicted-reset edge case)
+                    log "STATE TRANSITION: limited → available"
                     if send_notification \
                         "Claude Code limit cleared" \
                         "Your Claude Code session is available again. Time to resume work." \
                         "high" \
                         "white_check_mark,sparkles"
                     then
+                        current_state="available"
+                        json_set "$STATE_FILE" "state" "available"
+                        json_set "$STATE_FILE" "reset_epoch" ""
                         json_set "$STATE_FILE" "pending_notification" ""
+                    else
+                        # Hold the transition; retry on the next loop tick
+                        log "Will retry 'limit cleared' notification on next poll"
+                        json_set "$STATE_FILE" "pending_notification" "cleared"
                     fi
-                fi
-                ;;
-            "1:available"|"1:unknown"|"1:")
-                # Limit just hit (or first check found a limit)
-                log "STATE TRANSITION: → limited"
-                local body="Your Claude Code limit is currently exhausted. I'll let you know when it resets."
-                if [ -n "${RESET_EPOCH:-}" ]; then
-                    body="$body Expected reset: $(date -r "$RESET_EPOCH" '+%-I:%M %p')."
-                fi
-                # Persist reset_epoch first so a notification failure doesn't lose the parsed time
-                if [ -n "${RESET_EPOCH:-}" ]; then
-                    json_set "$STATE_FILE" "reset_epoch" "$RESET_EPOCH"
-                fi
-                if send_notification \
-                    "Claude Code limit reached" \
-                    "$body" \
-                    "default" \
-                    "warning,hourglass"
-                then
-                    current_state="limited"
-                    json_set "$STATE_FILE" "state" "limited"
-                    json_set "$STATE_FILE" "pending_notification" ""
-                else
-                    # Flip state anyway so we don't keep hammering claude every cycle —
-                    # but record that the "hit" notification still needs delivering.
-                    log "Will retry 'limit reached' notification on next poll"
-                    current_state="limited"
-                    json_set "$STATE_FILE" "state" "limited"
-                    json_set "$STATE_FILE" "pending_notification" "reached"
-                fi
-                ;;
-            "1:limited")
-                # Still limited; refresh reset_epoch if we just parsed a new one
-                if [ -n "${RESET_EPOCH:-}" ]; then
-                    json_set "$STATE_FILE" "reset_epoch" "$RESET_EPOCH"
-                fi
-                # Retry pending "reached" notification if we owe one
-                local pending
-                pending=$(json_get "$STATE_FILE" "pending_notification" "")
-                if [ "$pending" = "reached" ]; then
-                    log "Retrying pending 'limit reached' notification"
+                    ;;
+                "0:unknown"|"0:")
+                    # First successful check
+                    log "Initial state: available"
+                    current_state="available"
+                    json_set "$STATE_FILE" "state" "available"
+                    ;;
+                "0:available")
+                    # Still available, no notification.
+                    # But if a previous "cleared" notification failed, try again now.
+                    local pending
+                    pending=$(json_get "$STATE_FILE" "pending_notification" "")
+                    if [ "$pending" = "cleared" ]; then
+                        log "Retrying pending 'limit cleared' notification"
+                        if send_notification \
+                            "Claude Code limit cleared" \
+                            "Your Claude Code session is available again. Time to resume work." \
+                            "high" \
+                            "white_check_mark,sparkles"
+                        then
+                            json_set "$STATE_FILE" "pending_notification" ""
+                        fi
+                    fi
+                    ;;
+                "1:available"|"1:unknown"|"1:")
+                    # Limit just hit (or first check found a limit)
+                    log "STATE TRANSITION: → limited"
                     local body="Your Claude Code limit is currently exhausted. I'll let you know when it resets."
-                    local stored_reset
-                    stored_reset=$(json_get "$STATE_FILE" "reset_epoch" "")
-                    if [ -n "$stored_reset" ]; then
-                        body="$body Expected reset: $(date -r "$stored_reset" '+%-I:%M %p')."
+                    if [ -n "${RESET_EPOCH:-}" ]; then
+                        body="$body Expected reset: $(date -r "$RESET_EPOCH" '+%-I:%M %p')."
+                    fi
+                    # Persist reset_epoch first so a notification failure doesn't lose the parsed time
+                    if [ -n "${RESET_EPOCH:-}" ]; then
+                        json_set "$STATE_FILE" "reset_epoch" "$RESET_EPOCH"
                     fi
                     if send_notification \
                         "Claude Code limit reached" \
@@ -439,19 +441,54 @@ run_loop() {
                         "default" \
                         "warning,hourglass"
                     then
+                        current_state="limited"
+                        json_set "$STATE_FILE" "state" "limited"
                         json_set "$STATE_FILE" "pending_notification" ""
+                    else
+                        # Flip state anyway so we don't keep hammering claude every cycle —
+                        # but record that the "hit" notification still needs delivering.
+                        log "Will retry 'limit reached' notification on next poll"
+                        current_state="limited"
+                        json_set "$STATE_FILE" "state" "limited"
+                        json_set "$STATE_FILE" "pending_notification" "reached"
                     fi
-                fi
-                ;;
-            "2:"*)
-                # Unknown error, hold state
-                log "Holding state '$current_state' due to unknown error"
-                ;;
-        esac
+                    ;;
+                "1:limited")
+                    # Still limited; refresh reset_epoch if we just parsed a new one
+                    if [ -n "${RESET_EPOCH:-}" ]; then
+                        json_set "$STATE_FILE" "reset_epoch" "$RESET_EPOCH"
+                    fi
+                    # Retry pending "reached" notification if we owe one
+                    local pending
+                    pending=$(json_get "$STATE_FILE" "pending_notification" "")
+                    if [ "$pending" = "reached" ]; then
+                        log "Retrying pending 'limit reached' notification"
+                        local body="Your Claude Code limit is currently exhausted. I'll let you know when it resets."
+                        local stored_reset
+                        stored_reset=$(json_get "$STATE_FILE" "reset_epoch" "")
+                        if [ -n "$stored_reset" ]; then
+                            body="$body Expected reset: $(date -r "$stored_reset" '+%-I:%M %p')."
+                        fi
+                        if send_notification \
+                            "Claude Code limit reached" \
+                            "$body" \
+                            "default" \
+                            "warning,hourglass"
+                        then
+                            json_set "$STATE_FILE" "pending_notification" ""
+                        fi
+                    fi
+                    ;;
+                "2:"*)
+                    # Unknown error, hold state
+                    log "Holding state '$current_state' due to unknown error"
+                    ;;
+            esac
+        fi
 
         # Pick sleep interval based on state.
-        # When limited with a known reset time, sleep straight to ~30s after it
-        # instead of polling every few minutes — Claude tells us exactly when.
+        # When limited with a known future reset time, sleep straight to ~30s after it.
+        # On wake, woke_from_reset=1 so we notify without calling Claude again.
         local sleep_sec
         if [ "$current_state" = "limited" ]; then
             local stored_reset now_epoch seconds_until_reset
@@ -462,21 +499,17 @@ run_loop() {
                 seconds_until_reset=$((stored_reset - now_epoch))
 
                 if [ "$seconds_until_reset" -gt 0 ]; then
-                    # We're before the predicted reset.
-                    # Sleep until +30s past it, in one long wait. No intermediate polls.
                     sleep_sec=$((seconds_until_reset + 30))
+                    woke_from_reset=1
                     log "Reset predicted at $(date -r "$stored_reset" '+%H:%M:%S'). Sleeping ${sleep_sec}s until ~30s after."
                 else
-                    # We're already past the predicted reset but Claude still says limited.
-                    # Could be clock skew or a slightly delayed reset. Poll every 60s
-                    # for up to 10 minutes, then give up on this predicted time and
-                    # fall back to standard limited-interval polling.
+                    # Past the predicted reset but still limited — clock skew or delayed reset.
+                    # Poll every 60s for up to 10 minutes, then discard the prediction.
                     local seconds_past=$((-seconds_until_reset))
                     if [ "$seconds_past" -lt 600 ]; then
                         sleep_sec=60
                         log "Past predicted reset by ${seconds_past}s but still limited. Polling every 60s."
                     else
-                        # Predicted time was wrong by >10 min. Discard it.
                         log "Predicted reset was off by >10 min. Discarding and falling back to ${INTERVAL_LIMITED}s polling."
                         json_set "$STATE_FILE" "reset_epoch" ""
                         sleep_sec=$INTERVAL_LIMITED
